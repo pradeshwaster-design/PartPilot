@@ -232,7 +232,6 @@ class PartPilotViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    // --- Add Part Methods ---
     fun parseVoiceOrTextInput(input: String) {
         viewModelScope.launch {
             val candidates = aiEngine.parseVoiceOrTextPrompt(input)
@@ -240,10 +239,18 @@ class PartPilotViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun parsePhotoScan(mockDescription: String = "") {
+    fun processCapturedPhoto(bitmap: android.graphics.Bitmap) {
         viewModelScope.launch {
-            val candidates = aiEngine.parsePhotoBatch(mockDescription)
-            _addCandidates.value = candidates
+            _isAiThinking.value = true
+            try {
+                val candidates = aiEngine.parseCapturedPhoto(bitmap)
+                _addCandidates.value = candidates
+                _statusMessage.emit("Photo processed! ${candidates.size} candidate(s) ready to review.")
+            } catch (e: Exception) {
+                _statusMessage.emit("Photo analysis error: ${e.localizedMessage}")
+            } finally {
+                _isAiThinking.value = false
+            }
         }
     }
 

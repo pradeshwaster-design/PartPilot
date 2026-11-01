@@ -141,7 +141,8 @@ fun HomeScreen(
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         OutlinedTextField(
                             value = aiBarText,
@@ -149,7 +150,7 @@ fun HomeScreen(
                             modifier = Modifier.weight(1f),
                             placeholder = {
                                 Text(
-                                    text = "e.g. Where is my MPU6050?",
+                                    text = "Ask inventory or part specs...",
                                     fontFamily = IbmPlexSansFamily,
                                     fontSize = 13.sp,
                                     color = WorkshopTextMuted
@@ -164,7 +165,20 @@ fun HomeScreen(
                                 unfocusedBorderColor = WorkshopBorder
                             )
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+
+                        // Camera button to fast photo scan
+                        IconButton(
+                            onClick = onNavigateToAddPart,
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CameraAlt,
+                                contentDescription = "Scan with Camera",
+                                tint = WorkshopTeal
+                            )
+                        }
+
+                        // Send / ask button
                         IconButton(
                             onClick = {
                                 val query = aiBarText.ifBlank { "Where is my MPU6050?" }

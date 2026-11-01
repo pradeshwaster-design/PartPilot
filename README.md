@@ -9,6 +9,9 @@
 - **Platform:** Native Android (Kotlin + Jetpack Compose)
 - **Design System:** Material Design 3 workshop theme (`#F3F5F4` calm technical background, white cards with 1px `#DDE3E0` border and 14px radius, `#0B6B5D` workshop teal, IBM Plex Sans & IBM Plex Mono typography)
 - **Local Persistence:** Room Database with reactive Kotlin Flows and pre-populated seed data
+- **APK File Locations:**
+  - Build Output: `app/build/outputs/apk/debug/app-debug.apk`
+  - Public Assets: `public/PartPilot-debug.apk`
 - **Grounded Workshop AI:** Grounded Assistant with strict database tool calling (`search_parts`, `get_part`, `get_location_contents`, `list_projects`, `get_project_bom`) and before/after write diff confirmation cards
 - **Fast Intake:** Workbench photo scan simulation, natural language / voice parsing, and synonym duplicate detection
 - **QR Labeling:** On-device 2D matrix QR generator for physical bin tagging

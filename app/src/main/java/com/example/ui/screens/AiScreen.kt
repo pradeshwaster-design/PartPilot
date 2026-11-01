@@ -68,8 +68,10 @@ fun AiScreen(
         }
     }
 
+    var lastProcessedQuery by remember { mutableStateOf("") }
     LaunchedEffect(initialQuery) {
-        if (initialQuery.isNotBlank()) {
+        if (initialQuery.isNotBlank() && initialQuery != lastProcessedQuery) {
+            lastProcessedQuery = initialQuery
             viewModel.sendAiQuery(initialQuery)
         }
     }

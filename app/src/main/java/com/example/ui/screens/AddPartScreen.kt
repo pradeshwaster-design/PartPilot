@@ -1,10 +1,21 @@
 package com.example.ui.screens
 
+import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.ImageDecoder
+import android.net.Uri
+import android.os.Build
+import android.provider.MediaStore
 import android.speech.RecognizerIntent
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -18,13 +29,18 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.example.ai.ParsedPartCandidate
+import com.example.data.model.LocationEntity
 import com.example.data.model.PartGroup
 import com.example.ui.components.LocationBadge
 import com.example.ui.components.WorkshopCard
@@ -41,8 +57,9 @@ fun AddPartScreen(
     val context = LocalContext.current
     val candidates by viewModel.addCandidates.collectAsState()
     val allLocations by viewModel.allLocations.collectAsState()
+    val isThinking by viewModel.isAiThinking.collectAsState()
 
-    var inputModeTab by remember { mutableStateOf(0) } // 0: Photo / Vision, 1: Type / Voice, 2: Manual
+    var inputModeTab by remember { mutableStateOf(0) } // 0: Photo / Camera, 1: Type / Voice, 2: Manual
     var voiceOrTextInput by remember { mutableStateOf("") }
 
     // Manual form state
@@ -52,7 +69,41 @@ fun AddPartScreen(
     var manualQty by remember { mutableStateOf("1") }
     var manualLocId by remember { mutableStateOf<Long?>(1L) }
 
-    // Voice recognition launcher
+    // 1. Camera Launcher (returns Bitmap thumbnail directly without requiring FileProvider)
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicturePreview()
+    ) { bitmap: Bitmap? ->
+        if (bitmap != null) {
+            viewModel.processCapturedPhoto(bitmap)
+        }
+    }
+
+    // Camera Permission Launcher
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            takePictureLauncher.launch(null)
+        } else {
+            Toast.makeText(context, "Camera permission is required to capture photos", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // 2. Photo Picker Launcher (Gallery)
+    val pickVisualMediaLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val bitmap = loadBitmapFromUri(context, uri)
+            if (bitmap != null) {
+                viewModel.processCapturedPhoto(bitmap)
+            } else {
+                Toast.makeText(context, "Failed to load selected image", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // 3. Voice recognition launcher
     val speechLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -70,7 +121,7 @@ fun AddPartScreen(
             TopAppBar(
                 title = {
                     Text(
-                        text = "Fast Component Intake",
+                        text = "Component Intake",
                         fontFamily = IbmPlexSansFamily,
                         fontWeight = FontWeight.Bold,
                         fontSize = 18.sp
@@ -95,7 +146,7 @@ fun AddPartScreen(
                 .padding(padding)
                 .padding(horizontal = 16.dp)
         ) {
-            // Mode Tabs: Photo/Vision, Type/Voice, Manual
+            // Mode Tabs: Camera/Photo, Type/Voice, Manual Form
             TabRow(
                 selectedTabIndex = inputModeTab,
                 containerColor = WorkshopSurface,
@@ -107,8 +158,8 @@ fun AddPartScreen(
                 Tab(
                     selected = inputModeTab == 0,
                     onClick = { inputModeTab = 0 },
-                    text = { Text("Photo Scan", fontFamily = IbmPlexSansFamily, fontSize = 12.sp) },
-                    icon = { Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                    text = { Text("Camera & Photo", fontFamily = IbmPlexSansFamily, fontSize = 12.sp) },
+                    icon = { Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(18.dp)) }
                 )
                 Tab(
                     selected = inputModeTab == 1,
@@ -129,18 +180,18 @@ fun AddPartScreen(
             // Tab Content
             when (inputModeTab) {
                 0 -> {
-                    // Photo / Table Mode
+                    // Camera / Photo Mode
                     WorkshopCard {
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(
-                                text = "WORKBENCH PHOTO SCAN",
+                                text = "CAPTURE COMPONENT PHOTO",
                                 fontFamily = IbmPlexSansFamily,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 12.sp,
                                 color = WorkshopTeal
                             )
                             Text(
-                                text = "Photograph a single electronic part or a whole messy workbench table. The AI vision model classifies each part, suggests the best storage box, and flags any low-confidence reads.",
+                                text = "Take a real photo of your electronic part, IC marking, module, or workbench. The AI analyzes the image to identify the component and suggested storage bin.",
                                 fontFamily = IbmPlexSansFamily,
                                 fontSize = 13.sp,
                                 color = WorkshopText
@@ -152,15 +203,50 @@ fun AddPartScreen(
                             ) {
                                 Button(
                                     onClick = {
-                                        viewModel.parsePhotoScan("Workbench components detection")
+                                        val hasCameraPerm = ContextCompat.checkSelfPermission(
+                                            context,
+                                            Manifest.permission.CAMERA
+                                        ) == PackageManager.PERMISSION_GRANTED
+
+                                        if (hasCameraPerm) {
+                                            takePictureLauncher.launch(null)
+                                        } else {
+                                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                                        }
                                     },
                                     modifier = Modifier.weight(1f),
                                     colors = ButtonDefaults.buttonColors(containerColor = WorkshopTeal),
                                     shape = RoundedCornerShape(10.dp)
                                 ) {
-                                    Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Analyze Table Photo", fontFamily = IbmPlexSansFamily, fontSize = 13.sp)
+                                    Text("Open Camera", fontFamily = IbmPlexSansFamily, fontSize = 12.sp)
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        pickVisualMediaLauncher.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, WorkshopBorder)
+                                ) {
+                                    Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp), tint = WorkshopTeal)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("From Gallery", fontFamily = IbmPlexSansFamily, fontSize = 12.sp, color = WorkshopText)
+                                }
+                            }
+
+                            if (isThinking) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.padding(top = 4.dp)
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = WorkshopTeal, strokeWidth = 2.dp)
+                                    Text("Analyzing image features with AI...", fontFamily = IbmPlexSansFamily, fontSize = 12.sp, color = WorkshopTeal)
                                 }
                             }
                         }
@@ -178,7 +264,7 @@ fun AddPartScreen(
                                 color = WorkshopTeal
                             )
                             Text(
-                                text = "Type or speak natural phrases like \"Add 10 resistors 220 ohm to Shelf B level 1 box 2\".",
+                                text = "Speak or type natural instructions, such as: \"Add 10 resistors 220 ohm to Shelf B level 1 box 2\".",
                                 fontFamily = IbmPlexSansFamily,
                                 fontSize = 13.sp,
                                 color = WorkshopTextMuted
@@ -208,9 +294,7 @@ fun AddPartScreen(
                                         try {
                                             speechLauncher.launch(intent)
                                         } catch (e: Exception) {
-                                            // Fallback prompt simulation
-                                            voiceOrTextInput = "Add 10 resistors 220 ohm to Shelf B level 1 box 2"
-                                            viewModel.parseVoiceOrTextInput(voiceOrTextInput)
+                                            Toast.makeText(context, "Speech recognition not available; please type your request", Toast.LENGTH_SHORT).show()
                                         }
                                     },
                                     modifier = Modifier
@@ -244,7 +328,7 @@ fun AddPartScreen(
                             OutlinedTextField(
                                 value = manualName,
                                 onValueChange = { manualName = it },
-                                label = { Text("Component Name") },
+                                label = { Text("Component Name *") },
                                 modifier = Modifier.fillMaxWidth(),
                                 singleLine = true
                             )
@@ -278,6 +362,7 @@ fun AddPartScreen(
                                         viewModel.updateCandidate(cand.id) { cand }
                                         manualName = ""
                                         manualSpecs = ""
+                                        Toast.makeText(context, "Added to draft list below", Toast.LENGTH_SHORT).show()
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth(),
@@ -293,7 +378,7 @@ fun AddPartScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Candidates Review Header
+            // Candidates Review Section
             if (candidates.isNotEmpty()) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -350,7 +435,7 @@ fun AddPartScreen(
 @Composable
 private fun CandidateCard(
     candidate: ParsedPartCandidate,
-    locations: List<com.example.data.model.LocationEntity>,
+    locations: List<LocationEntity>,
     onUpdate: (ParsedPartCandidate) -> Unit,
     onRemove: () -> Unit,
     onMerge: (Long) -> Unit
@@ -358,6 +443,8 @@ private fun CandidateCard(
     val isLowConfidence = candidate.confidence < 0.7f
     val borderColor = if (isLowConfidence) ChipLowText.copy(alpha = 0.5f) else WorkshopBorder
     val bgColor = if (isLowConfidence) ChipLowBg.copy(alpha = 0.25f) else WorkshopSurface
+
+    var showGroupPicker by remember { mutableStateOf(false) }
 
     WorkshopCard(
         borderColor = borderColor,
@@ -380,7 +467,7 @@ private fun CandidateCard(
                     )
                     if (isLowConfidence) {
                         Text(
-                            text = "(Low — please verify)",
+                            text = "(Please confirm details)",
                             fontFamily = IbmPlexSansFamily,
                             fontSize = 11.sp,
                             color = ChipLowText
@@ -393,14 +480,81 @@ private fun CandidateCard(
                 }
             }
 
+            // Real Captured Photo Thumbnail (if captured from camera/gallery)
+            if (candidate.imageBitmap != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Image(
+                        bitmap = candidate.imageBitmap!!.asImageBitmap(),
+                        contentDescription = "Captured Part",
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .border(1.dp, WorkshopBorder, RoundedCornerShape(8.dp)),
+                        contentScale = ContentScale.Crop
+                    )
+                    Column {
+                        Text(
+                            text = "Captured Image Attached",
+                            fontFamily = IbmPlexSansFamily,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp,
+                            color = WorkshopTeal
+                        )
+                        Text(
+                            text = "Edit name and specs below to verify",
+                            fontFamily = IbmPlexSansFamily,
+                            fontSize = 11.sp,
+                            color = WorkshopTextMuted
+                        )
+                    }
+                }
+            }
+
             // Editable Name
             OutlinedTextField(
                 value = candidate.name,
                 onValueChange = { onUpdate(candidate.copy(name = it)) },
-                label = { Text("Component Name") },
+                label = { Text("Component Name *") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true
             )
+
+            // Group selector button
+            Box {
+                OutlinedButton(
+                    onClick = { showGroupPicker = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Category: ${candidate.group.displayName}", fontFamily = IbmPlexSansFamily, fontSize = 13.sp, color = WorkshopText)
+                        Icon(Icons.Default.ArrowDropDown, contentDescription = null, tint = WorkshopTeal)
+                    }
+                }
+
+                DropdownMenu(expanded = showGroupPicker, onDismissRequest = { showGroupPicker = false }) {
+                    PartGroup.values().forEach { grp ->
+                        DropdownMenuItem(
+                            text = { Text(grp.displayName, fontFamily = IbmPlexSansFamily) },
+                            onClick = {
+                                onUpdate(candidate.copy(group = grp))
+                                showGroupPicker = false
+                            }
+                        )
+                    }
+                }
+            }
 
             // Specs & Quantity
             Row(
@@ -433,7 +587,7 @@ private fun CandidateCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Suggested Box:",
+                    text = "Storage Bin:",
                     fontFamily = IbmPlexSansFamily,
                     fontSize = 12.sp,
                     color = WorkshopTextMuted
@@ -479,5 +633,21 @@ private fun CandidateCard(
                 }
             }
         }
+    }
+}
+
+private fun loadBitmapFromUri(context: Context, uri: Uri): Bitmap? {
+    return try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val source = ImageDecoder.createSource(context.contentResolver, uri)
+            ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                decoder.isMutableRequired = true
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            MediaStore.Images.Media.getBitmap(context.contentResolver, uri)
+        }
+    } catch (e: Exception) {
+        null
     }
 }

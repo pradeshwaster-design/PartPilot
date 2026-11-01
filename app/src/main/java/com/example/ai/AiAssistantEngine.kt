@@ -1,8 +1,10 @@
 package com.example.ai
 
+import android.graphics.Bitmap
 import com.example.data.local.SeedData
 import com.example.data.model.*
 import com.example.data.repository.PartPilotRepository
+import org.json.JSONArray
 import java.util.Locale
 
 data class ProposedWriteAction(
@@ -29,7 +31,8 @@ data class ParsedPartCandidate(
     var confidence: Float,
     var suggestedLocationId: Long? = null,
     var suggestedLocationCode: String = "A-1-B1",
-    var potentialDuplicates: List<PartEntity> = emptyList()
+    var potentialDuplicates: List<PartEntity> = emptyList(),
+    var imageBitmap: Bitmap? = null
 )
 
 data class AiChatMessage(
@@ -45,15 +48,16 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
 
     // --- Grounded AI Query Executor ---
     suspend fun processQuery(query: String): AiChatMessage {
-        val q = query.trim().lowercase(Locale.ROOT)
+        val q = query.trim()
+        val qLower = q.lowercase(Locale.ROOT)
         val parts = repository.searchParts("")
         val locations = repository.getLocationsList().associateBy { it.id }
-        val projects = repository.allProjectsFlowOrList()
+        val projects = repository.getAllProjects().ifEmpty { SeedData.projects }
 
-        // Check for Write Intent: "add 5 resistors...", "move esp32...", "adjust quantity..."
-        val writeAction = detectWriteAction(query, parts, locations, projects)
+        // 1. Detect Write Actions (Propose diff card with Confirm button)
+        val writeAction = detectWriteAction(q, parts, locations, projects)
         if (writeAction != null) {
-            val responseText = "I've drafted the requested change based on your workshop inventory. Please review the before/after details below and tap **Confirm Action** to apply it."
+            val responseText = "I've drafted the requested inventory change based on your workshop stock. Please review the before/after details below and tap **Confirm & Execute Action** to apply it."
             return AiChatMessage(
                 isUser = false,
                 text = responseText,
@@ -61,57 +65,74 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
             )
         }
 
-        // Tool 1: Where is X? / Do I have X? / search_parts
-        if (q.contains("where") || q.contains("do i have") || q.contains("have i got") || q.contains("find") || q.contains("how many")) {
-            // Find target part
-            val matchedPart = parts.find { p ->
-                val nameTokens = p.name.lowercase(Locale.ROOT).split(" ", "-", "/")
-                val queryTokens = q.split(" ", "?", "!", ",", ".")
-                nameTokens.any { token -> token.length > 2 && queryTokens.contains(token) } ||
-                        q.contains(p.name.lowercase(Locale.ROOT))
-            } ?: parts.minByOrNull { p ->
-                levenshteinDistance(p.name.lowercase(Locale.ROOT), q)
-            }
-
-            if (matchedPart != null && isRelevantMatch(matchedPart.name, q)) {
-                val locCode = matchedPart.locationId?.let { locations[it]?.code } ?: "Unassigned"
-                val freeStock = repository.computePartFreeStock(matchedPart.id)
-                val reserved = matchedPart.quantity - freeStock
-
-                val text = buildString {
-                    append("Yes, you have **${matchedPart.name}**.\n\n")
-                    append("• **Location**: Box `$locCode`\n")
-                    append("• **Total Stock**: ${matchedPart.quantity} units\n")
-                    append("• **Free to use**: $freeStock units")
-                    if (reserved > 0) {
-                        append(" ($reserved reserved in active projects)")
-                    }
-                    append("\n• **Condition**: ${matchedPart.condition.displayName}\n")
-                    append("• **Specs**: ${matchedPart.specs}\n")
-                    if (matchedPart.remarks.isNotBlank()) {
-                        append("• **Remarks**: ${matchedPart.remarks}\n")
-                    }
-                }
-                return AiChatMessage(isUser = false, text = text)
-            } else {
-                // If not found, suggest closest alternative
-                val closest = parts.filter { it.quantity > 0 }.take(3)
-                val text = buildString {
-                    append("You do not currently have that exact part in stock.\n\n")
-                    append("**Closest alternatives in your inventory:**\n")
-                    closest.forEach { alt ->
-                        val loc = alt.locationId?.let { locations[it]?.code } ?: "Unassigned"
-                        append("• **${alt.name}** (${alt.group.displayName}) - Qty: ${alt.quantity} in `$loc`\n")
-                    }
-                }
-                return AiChatMessage(isUser = false, text = text)
+        // 2. Try Gemini API first if configured
+        if (GeminiClient.hasValidApiKey()) {
+            val inventoryContext = buildInventorySummary(parts, locations, projects)
+            val geminiResponse = GeminiClient.generateGroundedResponse(q, inventoryContext)
+            if (!geminiResponse.isNullOrBlank()) {
+                return AiChatMessage(isUser = false, text = geminiResponse)
             }
         }
 
-        // Tool 2: What is in box X? / get_location_contents
+        // 3. Intelligent Grounded Local Engine
+        val localResponse = generateLocalGroundedResponse(q, qLower, parts, locations, projects)
+        return AiChatMessage(isUser = false, text = localResponse)
+    }
+
+    private fun buildInventorySummary(
+        parts: List<PartEntity>,
+        locations: Map<Long, LocationEntity>,
+        projects: List<ProjectEntity>
+    ): String {
+        val sb = StringBuilder()
+        sb.append("Current Workshop Inventory (${parts.size} component types, ${parts.sumOf { it.quantity }} total items):\n")
+        parts.forEach { p ->
+            val loc = p.locationId?.let { locations[it]?.code } ?: "Unassigned"
+            sb.append("- ${p.name} (${p.group.displayName}): ${p.quantity} in stock, Location: $loc, Condition: ${p.condition.displayName}, Specs: ${p.specs}\n")
+        }
+        sb.append("\nActive Projects:\n")
+        projects.forEach { pr ->
+            sb.append("- ${pr.name} [${pr.status.displayName}], Budget: $${pr.budgetCap}, Description: ${pr.description}\n")
+        }
+        return sb.toString()
+    }
+
+    private suspend fun generateLocalGroundedResponse(
+        query: String,
+        q: String,
+        parts: List<PartEntity>,
+        locations: Map<Long, LocationEntity>,
+        projects: List<ProjectEntity>
+    ): String {
+        // Query A: "Where is X?" / "Do I have X?"
+        val targetPart = findPartInQuery(q, parts)
+        if (targetPart != null && (q.contains("where") || q.contains("have") || q.contains("find") || q.contains("stock") || q.contains("got") || q.contains("is there"))) {
+            val locCode = targetPart.locationId?.let { locations[it]?.code } ?: "Unassigned"
+            val locDesc = targetPart.locationId?.let { locations[it]?.notes } ?: ""
+            val freeStock = repository.computePartFreeStock(targetPart.id)
+            val reserved = targetPart.quantity - freeStock
+
+            return buildString {
+                append("### ${targetPart.name}\n\n")
+                append("• **Location**: Box `$locCode`" + if (locDesc.isNotBlank()) " ($locDesc)" else "" + "\n")
+                append("• **Total Stock**: **${targetPart.quantity}** units\n")
+                append("• **Free to use**: **$freeStock** units")
+                if (reserved > 0) {
+                    append(" (*$reserved units reserved in active projects*)")
+                }
+                append("\n• **Condition**: ${targetPart.condition.displayName}\n")
+                append("• **Group**: ${targetPart.group.displayName}\n")
+                append("• **Specs**: ${targetPart.specs}\n")
+                if (targetPart.remarks.isNotBlank()) {
+                    append("• **Remarks**: ${targetPart.remarks}\n")
+                }
+            }
+        }
+
+        // Query B: "What is in box X?"
         val boxRegex = Regex("""([a-z])-([0-9])-([a-z0-9]+)""", RegexOption.IGNORE_CASE)
         val boxMatch = boxRegex.find(q)
-        if (boxMatch != null || q.contains("box") || q.contains("shelf")) {
+        if (boxMatch != null || (q.contains("box") && (q.contains("what") || q.contains("contents") || q.contains("show") || q.contains("list")))) {
             val targetCode = boxMatch?.value?.uppercase(Locale.ROOT)
             val location = if (targetCode != null) {
                 locations.values.find { it.code.equals(targetCode, ignoreCase = true) }
@@ -121,115 +142,157 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
 
             if (location != null) {
                 val boxParts = repository.getPartsByLocation(location.id)
-                val text = buildString {
-                    append("Contents for Box **`${location.code}`** (Shelf ${location.shelf}, Level ${location.level}, Box ${location.box}):\n\n")
+                return buildString {
+                    append("### Storage Bin **`${location.code}`**\n")
+                    append("Shelf **${location.shelf}**, Level **${location.level}**, Box **${location.box}**\n")
                     if (location.notes.isNotBlank()) {
-                        append("*${location.notes}*\n\n")
+                        append("*Category: ${location.notes}*\n\n")
+                    } else {
+                        append("\n")
                     }
                     if (boxParts.isEmpty()) {
-                        append("This box is currently empty.")
+                        append("This storage box is currently empty.")
                     } else {
+                        append("**Contents (${boxParts.size} parts):**\n")
                         boxParts.forEach { p ->
                             val free = repository.computePartFreeStock(p.id)
-                            append("• **${p.name}** — **${p.quantity}** in stock (${free} free), ${p.condition.displayName}\n")
+                            append("• **${p.name}** — **${p.quantity}x** in stock (${free} available), ${p.condition.displayName}\n")
                             append("  *${p.specs}*\n")
                         }
                     }
                 }
-                return AiChatMessage(isUser = false, text = text)
             }
         }
 
-        // Tool 3: What do I still need for X? / get_project_bom
+        // Query C: "What do I need for <project>?"
         val matchedProject = projects.find { proj ->
-            val projTokens = proj.name.lowercase(Locale.ROOT).split(" ")
-            projTokens.any { t -> t.length > 2 && q.contains(t) } || q.contains(proj.name.lowercase(Locale.ROOT))
+            val pName = proj.name.lowercase(Locale.ROOT)
+            q.contains(pName) || pName.split(" ").filter { it.length > 3 }.any { q.contains(it) }
         }
-
-        if (matchedProject != null) {
+        if (matchedProject != null && (q.contains("need") || q.contains("bom") || q.contains("parts") || q.contains("missing") || q.contains("status"))) {
             val bom = repository.getProjectParts(matchedProject.id)
-            val text = buildString {
-                append("BOM Status for **${matchedProject.name}**:\n\n")
-                var neededCount = 0
+            return buildString {
+                append("### BOM for ${matchedProject.name}\n")
+                append("*Status: ${matchedProject.status.displayName} | Budget: $${matchedProject.budgetCap}*\n\n")
                 var readyCount = 0
+                var missingCount = 0
 
                 bom.forEach { item ->
                     val status = repository.computeProjectPartStatus(item)
-                    val statusText = when (status) {
-                        ComputedPartStatus.HAVE -> "✅ HAVE (${item.qtyNeeded} owned & available)"
-                        ComputedPartStatus.NOT_ENOUGH -> "⚠️ NOT ENOUGH (Need ${item.qtyNeeded})"
-                        ComputedPartStatus.IN_CART -> "🛒 IN CART"
-                        ComputedPartStatus.NEED -> "❌ NEED TO BUY (${item.qtyNeeded} units)"
+                    val badge = when (status) {
+                        ComputedPartStatus.HAVE -> "✅ **HAVE** (${item.qtyNeeded} available)"
+                        ComputedPartStatus.NOT_ENOUGH -> "⚠️ **NOT ENOUGH** (Need ${item.qtyNeeded})"
+                        ComputedPartStatus.IN_CART -> "🛒 **IN CART**"
+                        ComputedPartStatus.NEED -> "❌ **NEED TO BUY** (${item.qtyNeeded} pcs)"
                     }
-                    if (status == ComputedPartStatus.HAVE) readyCount++ else neededCount++
-                    append("• **${item.name}**: $statusText [Checklist: ${item.checklistState.displayName}]\n")
+                    if (status == ComputedPartStatus.HAVE) readyCount++ else missingCount++
+                    append("• **${item.name}**: $badge\n")
+                    append("  Checklist state: *${item.checklistState.displayName}*\n")
                 }
 
-                append("\n**Summary:** $readyCount parts ready, $neededCount missing/in cart.\n")
-                append("Budget Cap: $${String.format(Locale.ROOT, "%.2f", matchedProject.budgetCap)}")
+                append("\n**Summary:** $readyCount components in stock, $missingCount missing/in cart.")
             }
-            return AiChatMessage(isUser = false, text = text)
         }
 
-        // Tool 4: List projects
-        if (q.contains("project") || q.contains("building") || q.contains("active")) {
-            val text = buildString {
-                append("You have **${projects.size}** projects on record:\n\n")
-                projects.forEach { pr ->
-                    append("• **${pr.name}** [${pr.status.displayName}]\n")
-                    append("  ${pr.description}\n")
-                    append("  Budget Cap: $${pr.budgetCap}\n\n")
+        // Query D: "Can I build X?" / Project Feasibility
+        if (q.contains("can i build") || q.contains("what can i build") || q.contains("build a")) {
+            val devBoards = parts.filter { it.group == PartGroup.MICROCONTROLLER && it.quantity > 0 }
+            val motorDrivers = parts.filter { it.group == PartGroup.MOTOR_DRIVER && it.quantity > 0 }
+            val sensors = parts.filter { it.group == PartGroup.SENSOR && it.quantity > 0 }
+            val batteries = parts.filter { it.group == PartGroup.POWER_BATTERY && it.quantity > 0 }
+
+            return buildString {
+                append("### Feasibility Assessment based on your Stock\n\n")
+                append("Here is what you currently have ready on hand:\n")
+                append("• **Microcontrollers:** ${devBoards.joinToString { it.name }}\n")
+                append("• **Motor Drivers:** ${if (motorDrivers.isNotEmpty()) motorDrivers.joinToString { it.name } else "None available"}\n")
+                append("• **Sensors:** ${sensors.joinToString { it.name }}\n")
+                append("• **Power:** ${batteries.joinToString { it.name }}\n\n")
+
+                if (q.contains("line follower") || q.contains("robot") || q.contains("rover")) {
+                    append("**Line Follower / Rover:** You have the Arduino Nano, TCRT5000 IR sensor array, L298N driver, TT motors, and 18650 batteries! You only need a 2WD robot chassis to complete it.")
+                } else if (q.contains("weather") || q.contains("iot")) {
+                    append("**IoT Weather Station:** You have the ESP32 (WiFi+BLE), DHT22 temperature sensor, and I2C OLED display ready in Box A-2-B3!")
+                } else {
+                    append("You can readily build:\n1. **Line Follower Robot** (Arduino Nano + TCRT5000 + L298N + TT Motors)\n2. **IoT Weather Monitor** (ESP32 + DHT22 + 0.96\" OLED)\n3. **Obstacle Avoiding Bot** (HC-SR04 + Servo SG90 + L298N)")
                 }
             }
-            return AiChatMessage(isUser = false, text = text)
         }
 
-        // General grounded response
-        val totalParts = parts.sumOf { it.quantity }
-        val lowStock = parts.filter { it.quantity <= it.minStock }
-        val text = buildString {
-            append("I'm grounded in your PartPilot inventory database ($totalParts total components across ${locations.size} storage bins).\n\n")
-            append("You can ask me questions like:\n")
-            append("• *\"Do I have an L298N?\"*\n")
-            append("• *\"Where is my MPU6050?\"*\n")
-            append("• *\"What is in box A-2-B3?\"*\n")
-            append("• *\"What do I still need for Line Follower v2?\"*\n")
-            if (lowStock.isNotEmpty()) {
-                append("\n⚠️ **Notice**: You have ${lowStock.size} parts at or below minimum stock limit.")
+        // Query E: Component Specs & Pinouts: "What is X?", "Pinout", "Voltage"
+        if (targetPart != null) {
+            val loc = targetPart.locationId?.let { locations[it]?.code } ?: "Unassigned"
+            return buildString {
+                append("### ${targetPart.name} Overview\n\n")
+                append("• **Category:** ${targetPart.group.displayName}\n")
+                append("• **Specifications:** ${targetPart.specs}\n")
+                append("• **Quantity in Stock:** ${targetPart.quantity} units (Location `$loc`)\n")
+                append("• **Condition:** ${targetPart.condition.displayName}\n")
+                if (targetPart.datasheetUrl.isNotBlank()) {
+                    append("• **Datasheet URL:** ${targetPart.datasheetUrl}\n")
+                }
+                if (targetPart.remarks.isNotBlank()) {
+                    append("• **Notes:** ${targetPart.remarks}\n")
+                }
+                append("\n*Tip: Ask me to 'move ${targetPart.name} to box ...' or 'adjust quantity' to update records.*")
             }
         }
-        return AiChatMessage(isUser = false, text = text)
-    }
 
-    private suspend fun PartPilotRepository.allProjectsFlowOrList(): List<ProjectEntity> {
-        val list = repository.getAllProjects()
-        return if (list.isNotEmpty()) list else SeedData.projects
-    }
-
-    private fun isRelevantMatch(name: String, query: String): Boolean {
-        val q = query.lowercase(Locale.ROOT)
-        val n = name.lowercase(Locale.ROOT)
-        val nameWords = n.split(" ", "-", "_", "/")
-        return nameWords.any { it.length > 2 && q.contains(it) } || q.contains(n)
-    }
-
-    private fun levenshteinDistance(s1: String, s2: String): Int {
-        val m = s1.length
-        val n = s2.length
-        val dp = Array(m + 1) { IntArray(n + 1) }
-        for (i in 0..m) dp[i][0] = i
-        for (j in 0..n) dp[0][j] = j
-        for (i in 1..m) {
-            for (j in 1..n) {
-                dp[i][j] = if (s1[i - 1] == s2[j - 1]) dp[i - 1][j - 1]
-                else 1 + minOf(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+        // Query F: Counts & Statistics
+        if (q.contains("how many") || q.contains("total") || q.contains("count") || q.contains("summary")) {
+            val totalQty = parts.sumOf { it.quantity }
+            val groupCounts = parts.groupBy { it.group }.mapValues { it.value.sumOf { p -> p.quantity } }
+            return buildString {
+                append("### Workshop Inventory Summary\n\n")
+                append("• **Total Components:** **$totalQty** physical items across **${parts.size}** distinct types\n")
+                append("• **Storage Bins:** **${locations.size}** labeled boxes\n")
+                append("• **Active Projects:** **${projects.count { it.status == ProjectStatus.ACTIVE }}**\n\n")
+                append("**Breakdown by Category:**\n")
+                groupCounts.entries.sortedByDescending { it.value }.forEach { (grp, count) ->
+                    append("• ${grp.displayName}: **$count** units\n")
+                }
             }
         }
-        return dp[m][n]
+
+        // Query G: Dynamic fallback based on user query
+        return buildString {
+            append("I checked your workshop inventory for: *\"$query\"*.\n\n")
+            val matching = parts.filter { p ->
+                val words = q.split(" ", "?", "!", ",", ".")
+                words.any { w -> w.length > 3 && p.name.contains(w, ignoreCase = true) || p.specs.contains(w, ignoreCase = true) }
+            }
+            if (matching.isNotEmpty()) {
+                append("**Related parts in stock:**\n")
+                matching.take(4).forEach { m ->
+                    val loc = m.locationId?.let { locations[it]?.code } ?: "Unassigned"
+                    append("• **${m.name}** (${m.quantity} in `$loc`) — *${m.specs}*\n")
+                }
+            } else {
+                append("I couldn't find a direct match in your storage bins. You currently have **${parts.size}** cataloged component types in stock.\n\n")
+                append("You can ask me:\n")
+                append("• *\"Do I have an L298N?\"*\n")
+                append("• *\"Where is my MPU6050?\"*\n")
+                append("• *\"What is in box A-2-B3?\"*\n")
+                append("• *\"Add 5 resistors 220 ohm to Box A-1-B1\"*\n")
+                append("• *\"What do I still need for Line Follower v2?\"*")
+            }
+        }
+    }
+
+    private fun findPartInQuery(q: String, parts: List<PartEntity>): PartEntity? {
+        val lower = q.lowercase(Locale.ROOT)
+        // Exact name check
+        parts.find { lower.contains(it.name.lowercase(Locale.ROOT)) }?.let { return it }
+
+        // Token match
+        return parts.find { p ->
+            val pTokens = p.name.lowercase(Locale.ROOT).split(" ", "-", "/", "_")
+            pTokens.any { t -> t.length > 2 && lower.contains(t) }
+        }
     }
 
     // --- Detect Write Action and create Diff Card ---
-    private suspend fun detectWriteAction(
+    private fun detectWriteAction(
         query: String,
         parts: List<PartEntity>,
         locations: Map<Long, LocationEntity>,
@@ -239,7 +302,7 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
 
         // Action: Move part X to location Y
         if (q.contains("move") && (q.contains("box") || q.contains("shelf") || q.contains("to "))) {
-            val targetPart = parts.find { isRelevantMatch(it.name, q) }
+            val targetPart = findPartInQuery(q, parts)
             val targetLoc = locations.values.find { q.contains(it.code.lowercase(Locale.ROOT)) || q.contains(it.box.lowercase(Locale.ROOT)) }
 
             if (targetPart != null && targetLoc != null) {
@@ -259,7 +322,7 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
         if (q.contains("adjust") || q.contains("set count") || (q.contains("stock") && (q.contains("to ") || q.contains("is ")))) {
             val numMatch = Regex("""\b(\d+)\b""").find(q)
             val newQty = numMatch?.groupValues?.get(1)?.toIntOrNull()
-            val targetPart = parts.find { isRelevantMatch(it.name, q) }
+            val targetPart = findPartInQuery(q, parts)
 
             if (targetPart != null && newQty != null) {
                 return ProposedWriteAction(
@@ -280,24 +343,23 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
             val targetLoc = locations.values.find { q.contains(it.code.lowercase(Locale.ROOT)) || q.contains(it.box.lowercase(Locale.ROOT)) }
                 ?: locations.values.firstOrNull()
 
-            // Extract item name
             var rawName = q.replace(Regex("""^(add|please add|register)\s+""", RegexOption.IGNORE_CASE), "")
-            rawName = rawName.replace(Regex("""\b(\d+)\s*units?\b|\b(\d+)\b""", RegexOption.IGNORE_CASE), "")
-            rawName = rawName.replace(Regex("""(to\s+shelf.*|to\s+box.*|in\s+box.*)""", RegexOption.IGNORE_CASE), "").trim()
+            rawName = rawName.replace(Regex("""\b(\d+)\s*(units?|pcs?|pieces?|x)?\b""", RegexOption.IGNORE_CASE), "")
+            rawName = rawName.replace(Regex("""(to\s+shelf.*|to\s+box.*|in\s+box.*|into\s+.*)""", RegexOption.IGNORE_CASE), "").trim()
 
-            val cleanedName = if (rawName.isBlank()) "New Component" else rawName.replaceFirstChar { it.uppercase() }
+            val cleanedName = if (rawName.isBlank()) "Electronic Component" else rawName.replaceFirstChar { it.uppercase() }
             val group = guessGroupFromName(cleanedName)
 
             return ProposedWriteAction(
                 actionType = "ADD_PART",
-                title = "Add New Component to Stock",
+                title = "Add Component to Stock",
                 beforeState = "Part not yet cataloged",
                 afterState = "Name: $cleanedName\nQty: $qty\nGroup: ${group.displayName}\nLocation: ${targetLoc?.code ?: "A-1-B1"}",
                 partName = cleanedName,
                 group = group,
                 newQuantity = qty,
                 targetLocationId = targetLoc?.id ?: 1L,
-                specs = "Added via natural language command"
+                specs = "Added via natural language"
             )
         }
 
@@ -316,7 +378,6 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
                     (q.contains(it.shelf, ignoreCase = true) && q.contains(it.box, ignoreCase = true))
         } ?: locations.firstOrNull()
 
-        // Clean part name
         var cleanName = q.replace(Regex("""^(add|please add|register)\s+""", RegexOption.IGNORE_CASE), "")
         cleanName = cleanName.replace(Regex("""\b(\d+)\s*(units?|pcs?|pieces?|x)?\b""", RegexOption.IGNORE_CASE), "")
         cleanName = cleanName.replace(Regex("""(to\s+shelf.*|to\s+box.*|in\s+box.*|into\s+.*)""", RegexOption.IGNORE_CASE), "").trim()
@@ -344,47 +405,66 @@ class AiAssistantEngine(private val repository: PartPilotRepository) {
         )
     }
 
-    // --- Parser for Workbench / Photo Capture into Multiple Candidates ---
-    suspend fun parsePhotoBatch(photoDescriptionOrKeywords: String = ""): List<ParsedPartCandidate> {
+    // --- Parser for Real Captured Workbench/Camera Photo ---
+    suspend fun parseCapturedPhoto(bitmap: Bitmap): List<ParsedPartCandidate> {
         val locations = repository.getLocationsList()
         val locMap = locations.associateBy { it.id }
 
-        // Realistic components detected on workbench table
-        val detected = listOf(
+        // If Gemini Vision API is available, analyze the real picture!
+        val visionJson = GeminiClient.analyzeWorkbenchImage(bitmap)
+        if (!visionJson.isNullOrBlank()) {
+            try {
+                val jsonArr = JSONArray(visionJson)
+                val results = mutableListOf<ParsedPartCandidate>()
+                for (i in 0 until jsonArr.length()) {
+                    val obj = jsonArr.getJSONObject(i)
+                    val name = obj.optString("name", "Electronic Component")
+                    val groupStr = obj.optString("group", "Other")
+                    val specs = obj.optString("specs", "Visual scan")
+                    val qty = obj.optInt("quantity", 1)
+                    val conf = obj.optDouble("confidence", 0.85).toFloat()
+
+                    val group = PartGroup.values().find { it.displayName.equals(groupStr, ignoreCase = true) } ?: guessGroupFromName(name)
+                    val duplicates = repository.findPotentialDuplicates(name)
+
+                    val targetLoc = locations.find { it.notes.contains(group.displayName, ignoreCase = true) } ?: locations.firstOrNull()
+
+                    results.add(
+                        ParsedPartCandidate(
+                            name = name,
+                            group = group,
+                            specs = specs,
+                            quantity = qty,
+                            confidence = conf,
+                            suggestedLocationId = targetLoc?.id,
+                            suggestedLocationCode = targetLoc?.code ?: "A-1-B1",
+                            potentialDuplicates = duplicates,
+                            imageBitmap = bitmap
+                        )
+                    )
+                }
+                if (results.isNotEmpty()) {
+                    return results
+                }
+            } catch (e: Exception) {
+                // fall through to local fallback
+            }
+        }
+
+        // Local Fallback for captured image: create an editable candidate card initialized with the user's photo
+        return listOf(
             ParsedPartCandidate(
-                name = "ESP32-CAM AI-Thinker Module",
-                group = PartGroup.MICROCONTROLLER,
-                specs = "WiFi+BT SoC with OV2640 2MP Camera, MicroSD slot",
+                name = "New Component",
+                group = PartGroup.OTHER,
+                specs = "Photo captured (${bitmap.width}x${bitmap.height}px)",
                 quantity = 1,
-                confidence = 0.94f,
+                confidence = 0.65f, // triggers amber verification card to let user confirm/edit label
                 suggestedLocationId = 1,
-                suggestedLocationCode = locMap[1]?.code ?: "A-1-B1"
-            ),
-            ParsedPartCandidate(
-                name = "SG90 Micro Servo 9g",
-                group = PartGroup.MECHANICAL,
-                specs = "4.8V-6V nylon gear rotary actuator",
-                quantity = 2,
-                confidence = 0.91f,
-                suggestedLocationId = 3,
-                suggestedLocationCode = locMap[3]?.code ?: "B-1-B2"
-            ),
-            ParsedPartCandidate(
-                name = "Unknown 8-pin DIP IC",
-                group = PartGroup.SEMICONDUCTOR,
-                specs = "Marking partially obscured: NE555 / OpAmp?",
-                quantity = 5,
-                confidence = 0.52f, // < 0.7 triggers amber prompt card!
-                suggestedLocationId = 1,
-                suggestedLocationCode = locMap[1]?.code ?: "A-1-B1"
+                suggestedLocationCode = locMap[1]?.code ?: "A-1-B1",
+                potentialDuplicates = emptyList(),
+                imageBitmap = bitmap
             )
         )
-
-        // Enrich with potential duplicates
-        return detected.map { candidate ->
-            val duplicates = repository.findPotentialDuplicates(candidate.name)
-            candidate.copy(potentialDuplicates = duplicates)
-        }
     }
 
     private fun guessGroupFromName(name: String): PartGroup {
