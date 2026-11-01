@@ -1,0 +1,9 @@
+{
+  "name": "PartPilot",
+  "description": "Personal AI companion & inventory for electronics hobbyists and robotics makers",
+  "requestFramePermissions": [
+    "android.permission.CAMERA",
+    "android.permission.RECORD_AUDIO"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
